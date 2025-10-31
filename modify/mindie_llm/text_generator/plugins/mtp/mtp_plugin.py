@@ -213,7 +213,7 @@ class MtpPlugin(Plugin):
         
         Args:
             draft_logits: Draft model的logits, shape [num_tokens, vocab_size]
-            target_logits: Target model的logits, shape [num_tokens, vocab_size]  
+            target_logits: Target model的logits, shape [num_tokens+1, vocab_size]
             draft_tokens: Draft model生成的tokens, shape [num_tokens]
             temperature: 采样温度
             
@@ -239,7 +239,8 @@ class MtpPlugin(Plugin):
 
         accepted_tokens = []
         num_tokens = draft_tokens.size(0)
-        
+        rejected = False  # 标记是否发生了拒绝
+
         print(f"[Rejection Sampling] Starting verification loop for {num_tokens} tokens")
 
         for j in range(num_tokens):
@@ -281,18 +282,23 @@ class MtpPlugin(Plugin):
                     print(f"[Rejection Sampling] Sampled new token from target (residual empty): {new_token}")
 
                 accepted_tokens.append(new_token)
+                rejected = True  # 标记发生了拒绝
                 # 拒绝后停止
                 print(f"[Rejection Sampling] Stopping after rejection at position {j}")
                 break
         
-        # 如果所有draft tokens都被接受，从最后的target分布采样一个新token
-        if len(accepted_tokens) == num_tokens:
-            # 使用最后一个target logits采样
+        # 只有当所有draft tokens都被接受（没有发生拒绝）时，才从最后的target分布采样bonus token
+        if not rejected:
+            # 使用最后一个target logits采样bonus token
             last_token = torch.multinomial(target_probs[-1], num_samples=1).item()
             accepted_tokens.append(last_token)
-            print(f"[Rejection Sampling] All tokens accepted, bonus token sampled: {last_token}")
+            num_accepted = num_tokens  # 所有draft tokens都被接受
+            print(f"[Rejection Sampling] All {num_tokens} tokens accepted, bonus token sampled: {last_token}")
+        else:
+            # 发生了拒绝，最后一个token是从残差分布采样的，不计入accepted
+            num_accepted = len(accepted_tokens) - 1
+            print(f"[Rejection Sampling] Rejection occurred, {num_accepted} tokens accepted before rejection")
 
-        num_accepted = len(accepted_tokens) - 1  # -1因为最后一个是新采样的
         print(f"[Rejection Sampling] Final result - accepted_tokens: {accepted_tokens}, "
                    f"num_accepted: {num_accepted}")
 
