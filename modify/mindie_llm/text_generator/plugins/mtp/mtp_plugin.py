@@ -224,13 +224,24 @@ class MtpPlugin(Plugin):
         device = draft_logits.device
         vocab_size = draft_logits.size(-1)
         
+        print(f"[Rejection Sampling] Input shapes - draft_logits: {draft_logits.shape}, "
+                   f"target_logits: {target_logits.shape}, draft_tokens: {draft_tokens.shape}, "
+                   f"vocab_size: {vocab_size}, temperature: {temperature}")
+        print(f"[Rejection Sampling] Draft tokens: {draft_tokens.tolist()}")
+
         # 应用温度并计算概率分布
         draft_probs = F.softmax(draft_logits / temperature, dim=-1)
         target_probs = F.softmax(target_logits / temperature, dim=-1)
         
+        print(f"[Rejection Sampling] Probability distribution computed - "
+                   f"draft_probs range: [{draft_probs.min().item():.6f}, {draft_probs.max().item():.6f}], "
+                   f"target_probs range: [{target_probs.min().item():.6f}, {target_probs.max().item():.6f}]")
+
         accepted_tokens = []
         num_tokens = draft_tokens.size(0)
         
+        print(f"[Rejection Sampling] Starting verification loop for {num_tokens} tokens")
+
         for j in range(num_tokens):
             # 获取draft token的概率
             draft_token = draft_tokens[j].item()
@@ -240,27 +251,38 @@ class MtpPlugin(Plugin):
             # 计算接受概率: min{1, p(x)/q(x)}
             accept_prob = min(1.0, p_x / (q_x + 1e-10))  # 添加小值避免除零
             
+            print(f"[Rejection Sampling] Token {j}: draft_token={draft_token}, "
+                       f"q_x={q_x:.6f}, p_x={p_x:.6f}, accept_prob={accept_prob:.6f}")
+
             # 伯努利采样决定是否接受
-            if np.random.random() < accept_prob:
+            random_value = np.random.random()
+            if random_value < accept_prob:
                 # 接受draft token
                 accepted_tokens.append(draft_token)
+                print(f"[Rejection Sampling] Token {j} ACCEPTED (random={random_value:.6f} < {accept_prob:.6f})")
             else:
                 # 拒绝，从残差分布采样
                 # residual(x) = norm(max{0, p(x) - q(x)})
                 residual = torch.clamp(target_probs[j] - draft_probs[j], min=0.0)
                 residual_sum = residual.sum()
                 
+                print(f"[Rejection Sampling] Token {j} REJECTED (random={random_value:.6f} >= {accept_prob:.6f}), "
+                           f"residual_sum={residual_sum.item():.6f}")
+
                 if residual_sum > 1e-10:
                     # 归一化残差分布
                     residual_probs = residual / residual_sum
                     # 从残差分布采样新token
                     new_token = torch.multinomial(residual_probs, num_samples=1).item()
+                    print(f"[Rejection Sampling] Sampled new token from residual: {new_token}")
                 else:
                     # 如果残差分布为空，直接从target分布采样
                     new_token = torch.multinomial(target_probs[j], num_samples=1).item()
-                
+                    print(f"[Rejection Sampling] Sampled new token from target (residual empty): {new_token}")
+
                 accepted_tokens.append(new_token)
                 # 拒绝后停止
+                print(f"[Rejection Sampling] Stopping after rejection at position {j}")
                 break
         
         # 如果所有draft tokens都被接受，从最后的target分布采样一个新token
@@ -268,14 +290,23 @@ class MtpPlugin(Plugin):
             # 使用最后一个target logits采样
             last_token = torch.multinomial(target_probs[-1], num_samples=1).item()
             accepted_tokens.append(last_token)
-        
-        return accepted_tokens, len(accepted_tokens) - 1  # -1因为最后一个是新采样的
+            print(f"[Rejection Sampling] All tokens accepted, bonus token sampled: {last_token}")
+
+        num_accepted = len(accepted_tokens) - 1  # -1因为最后一个是新采样的
+        print(f"[Rejection Sampling] Final result - accepted_tokens: {accepted_tokens}, "
+                   f"num_accepted: {num_accepted}")
+
+        return accepted_tokens, num_accepted
 
     def plugin_verify(self, sampling_output, cache_ids, result):
         sampling_output.repeating_indices = np.arange(len(cache_ids))
         if self.input_metadata.is_prefill:
+            print("[Plugin Verify] Skipping verification for prefill phase")
             return
         
+        print(f"[Plugin Verify] Starting verification - cache_ids: {cache_ids}, "
+                   f"result length: {len(result)}, result types: {[type(r) for r in result]}")
+
         # 提取draft tokens和logits
         # result格式取决于是否使用 forward_mtp_decoding_v2
         if len(result) >= 4 and isinstance(result[3], torch.Tensor):
@@ -284,10 +315,14 @@ class MtpPlugin(Plugin):
             draft_tokens = result[2]   # Draft tokens
             draft_logits = result[3]   # Draft model logits
             use_rejection_sampling = True
+            print(f"[Plugin Verify] Using rejection sampling - target_logits shape: {target_logits.shape}, "
+                       f"draft_tokens shape: {draft_tokens.shape}, draft_logits shape: {draft_logits.shape}")
         else:
             # 兼容旧格式
             draft_tokens = result[2].cpu() if torch.is_tensor(result[2]) else result[2]
             use_rejection_sampling = False
+            print(f"[Plugin Verify] Using greedy verification (fallback) - draft_tokens: {draft_tokens}")
+
         draft_token = result[2].cpu()
         next_tokens_uncheck = sampling_output.token_ids
         input_metadata = self.input_metadata
@@ -295,9 +330,15 @@ class MtpPlugin(Plugin):
         out_seq_len = 1 if input_metadata.is_prefill else (self.num_speculative_tokens + 1)
         start_pos = 0
         draft_token_num_per_batch = self.num_speculative_tokens
+
+        print(f"[Plugin Verify] Processing batches - batch_size: {input_metadata.batch_size}, "
+                   f"out_seq_len: {out_seq_len}, draft_token_num_per_batch: {draft_token_num_per_batch}")
+        print(f"[Plugin Verify] Initial next_tokens_uncheck: {next_tokens_uncheck}")
+
         for batch in range(input_metadata.batch_size):
             end = start_pos + out_seq_len
-            
+            print(f"[Plugin Verify] Batch {batch} - start_pos: {start_pos}, end: {end}")
+
             if use_rejection_sampling:
                 # 使用拒绝采样算法
                 batch_draft_tokens = draft_tokens[
@@ -306,6 +347,10 @@ class MtpPlugin(Plugin):
                     batch * draft_token_num_per_batch: (batch + 1) * draft_token_num_per_batch]
                 batch_target_logits = target_logits[start_pos:end]
                 
+                print(f"[Plugin Verify] Batch {batch} - batch_draft_tokens shape: {batch_draft_tokens.shape}, "
+                           f"batch_draft_logits shape: {batch_draft_logits.shape}, "
+                           f"batch_target_logits shape: {batch_target_logits.shape}")
+
                 # 执行拒绝采样
                 accepted_tokens, num_accepted = self.rejection_sampling_verify(
                     batch_draft_logits, 
@@ -313,28 +358,42 @@ class MtpPlugin(Plugin):
                     batch_draft_tokens
                 )
                 
+                print(f"[Plugin Verify] Batch {batch} - accepted_tokens: {accepted_tokens}, "
+                           f"num_accepted: {num_accepted}")
+
                 # 更新sampling_output中的tokens
+                original_tokens = [next_tokens_uncheck[start_pos + i] for i in range(min(len(accepted_tokens), len(next_tokens_uncheck) - start_pos))]
                 for i, token in enumerate(accepted_tokens):
                     if start_pos + i < len(next_tokens_uncheck):
                         sampling_output.token_ids[start_pos + i] = token
-                
+                print(f"[Plugin Verify] Batch {batch} - updated tokens from {original_tokens} to {accepted_tokens}")
+
                 indices = num_accepted
                 next_tokens_indices.append(list(range(start_pos, start_pos + len(accepted_tokens))))
             else:
                 # 原始的贪婪验证方法（作为fallback）
                 next_guess_by_batch = next_tokens_uncheck[start_pos:end]
+                verify_guess_tokens = draft_tokens[
+                    batch * draft_token_num_per_batch: (batch + 1) * draft_token_num_per_batch]
+                if torch.is_tensor(verify_guess_tokens):
+                    verify_guess_tokens = verify_guess_tokens.view(-1)
 
-                verify_guess_tokens = \
-                    draft_token[batch * draft_token_num_per_batch: (batch + 1) * draft_token_num_per_batch].view(-1)
+                print(f"[Plugin Verify] Batch {batch} - greedy verification: "
+                           f"next_guess_by_batch: {next_guess_by_batch}, "
+                           f"verify_guess_tokens: {verify_guess_tokens}")
 
                 indices = self.decoding_policy.verify_greedy_one_batch(verify_guess_tokens, next_guess_by_batch)
                 next_tokens_indices.append(list(range(start_pos, start_pos + indices + 1)))
+                print(f"[Plugin Verify] Batch {batch} - greedy indices: {indices}")
 
             # 统计第一个和第二个Token的接受情况
+            print(f"[Plugin Verify] Batch {batch} - updating acceptance statistics with indices: {indices}")
             self._update_acceptance_statistics(indices)
             
             start_pos += out_seq_len
         
+        print(f"[Plugin Verify] All batches processed - next_tokens_indices: {next_tokens_indices}")
+
         # 更新迭代计数并打印接受率
         self._update_and_print_acceptance_rate()
         
@@ -343,8 +402,15 @@ class MtpPlugin(Plugin):
         output_space_left2 = self.input_manager.cache.cache_config.max_seq_len - \
             self.input_manager.cache.cached_seq_lens[cache_ids]
         output_space_left = np.minimum(output_space_left1, output_space_left2)
+
+        print(f"[Plugin Verify] Output space calculation - output_token_len: {output_token_len}, "
+                   f"output_space_left: {output_space_left}")
+
         self.decoding_policy.stop_criteria(sampling_output, output_space_left, next_tokens_indices)
         self.reshape_speculative_outputs(sampling_output, next_tokens_indices)
+
+        print(f"[Plugin Verify] Final sampling_output.token_ids: {sampling_output.token_ids}")
+        print(f"[Plugin Verify] Final sampling_output.num_new_tokens: {sampling_output.num_new_tokens}")
 
     def plugin_cache_update(self, cache_ids, sampling_output, la_cache_input, is_prefill=False):
         result, _ = la_cache_input
