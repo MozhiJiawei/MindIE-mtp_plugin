@@ -309,7 +309,7 @@ class MtpPlugin(Plugin):
         return accepted_tokens, num_accepted
 
     def plugin_verify(self, sampling_output, cache_ids, result):
-        sampling_output.repeating_indiceas = np.arange(len(cache_ids))
+        sampling_output.repeating_indices = np.arange(len(cache_ids))
         if self.input_metadata.is_prefill:
             print("[Plugin Verify] Skipping verification for prefill phase")
             return
