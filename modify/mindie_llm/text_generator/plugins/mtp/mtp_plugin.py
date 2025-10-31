@@ -186,6 +186,12 @@ class MtpPlugin(Plugin):
         self.sampling_param = sampling_metadata
         self.decoding_policy.sampling_param = self.sampling_param
         self.input_metadata = input_metadata
+
+        # 详细的调试信息
+        print(f"[Sample Preprocess] input_metadata.is_prefill: {input_metadata.is_prefill}, "
+              f"sampling_metadata.is_prefill: {sampling_metadata.is_prefill if sampling_metadata else 'None'}, "
+              f"input_metadata.batch_size: {input_metadata.batch_size}")
+
         if isinstance(result, tuple):
             logits = result[0]
         else:
@@ -309,9 +315,22 @@ class MtpPlugin(Plugin):
         return accepted_tokens, num_accepted
 
     def plugin_verify(self, sampling_output, cache_ids, result):
-        sampling_output.repeating_indiceas = np.arange(len(cache_ids))
+        sampling_output.repeating_indices = np.arange(len(cache_ids))
+
+        # 详细调试信息：检查 input_metadata 的状态
+        print(f"[Plugin Verify Entry] self.input_metadata.is_prefill: {self.input_metadata.is_prefill}, "
+              f"cache_ids: {cache_ids}, "
+              f"has num_new_tokens: {hasattr(sampling_output, 'num_new_tokens')}, "
+              f"num_new_tokens value: {sampling_output.num_new_tokens if hasattr(sampling_output, 'num_new_tokens') else 'N/A'}")
+
+        # 在 prefill 阶段，MTP 不需要验证，因为 prefill 只生成一个 token
+        # 但我们需要正确设置 num_new_tokens，否则会导致生成循环无法正确计数
         if self.input_metadata.is_prefill:
-            print("[Plugin Verify] Skipping verification for prefill phase")
+            print("[Plugin Verify] Prefill phase - setting num_new_tokens to 1 for each sequence")
+            # 确保每个序列的 num_new_tokens 被设置为 1
+            if not hasattr(sampling_output, 'num_new_tokens') or sampling_output.num_new_tokens is None:
+                sampling_output.num_new_tokens = np.ones(len(cache_ids), dtype=np.int32)
+            print(f"[Plugin Verify] After setting - num_new_tokens: {sampling_output.num_new_tokens}")
             return
         
         print(f"[Plugin Verify] Starting verification - cache_ids: {cache_ids}, "
