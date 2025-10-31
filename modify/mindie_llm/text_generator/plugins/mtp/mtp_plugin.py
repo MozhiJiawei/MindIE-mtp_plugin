@@ -292,20 +292,24 @@ class MtpPlugin(Plugin):
             # 使用最后一个target logits采样bonus token
             last_token = torch.multinomial(target_probs[-1], num_samples=1).item()
             accepted_tokens.append(last_token)
-            num_accepted = num_tokens  # 所有draft tokens都被接受
-            print(f"[Rejection Sampling] All {num_tokens} tokens accepted, bonus token sampled: {last_token}")
+            # num_accepted 表示实际接受的draft tokens数量，不包括bonus token
+            num_accepted = num_tokens
+            print(f"[Rejection Sampling] All {num_tokens} draft tokens accepted, bonus token sampled: {last_token}")
+            print(f"[Rejection Sampling] Total tokens to use: {len(accepted_tokens)} (draft + bonus)")
         else:
-            # 发生了拒绝，最后一个token是从残差分布采样的，不计入accepted
+            # 发生了拒绝，最后一个token是从残差分布采样的新token
+            # num_accepted 表示被接受的draft tokens数量（拒绝位置之前的tokens）
             num_accepted = len(accepted_tokens) - 1
-            print(f"[Rejection Sampling] Rejection occurred, {num_accepted} tokens accepted before rejection")
+            print(f"[Rejection Sampling] Rejection occurred, {num_accepted} draft tokens accepted before rejection")
+            print(f"[Rejection Sampling] Total tokens to use: {len(accepted_tokens)} (accepted + resampled)")
 
         print(f"[Rejection Sampling] Final result - accepted_tokens: {accepted_tokens}, "
-                   f"num_accepted: {num_accepted}")
+                   f"num_accepted (draft only): {num_accepted}, total_tokens: {len(accepted_tokens)}")
 
         return accepted_tokens, num_accepted
 
     def plugin_verify(self, sampling_output, cache_ids, result):
-        sampling_output.repeating_indices = np.arange(len(cache_ids))
+        sampling_output.repeating_indiceas = np.arange(len(cache_ids))
         if self.input_metadata.is_prefill:
             print("[Plugin Verify] Skipping verification for prefill phase")
             return
@@ -364,18 +368,24 @@ class MtpPlugin(Plugin):
                     batch_draft_tokens
                 )
                 
+                # num_accepted 是被接受的draft tokens数量
+                # len(accepted_tokens) 是总共要使用的tokens数量（包括bonus token或重采样token）
+                total_tokens = len(accepted_tokens)
+
                 print(f"[Plugin Verify] Batch {batch} - accepted_tokens: {accepted_tokens}, "
-                           f"num_accepted: {num_accepted}")
+                           f"num_accepted (draft): {num_accepted}, total_tokens: {total_tokens}")
 
                 # 更新sampling_output中的tokens
-                original_tokens = [next_tokens_uncheck[start_pos + i] for i in range(min(len(accepted_tokens), len(next_tokens_uncheck) - start_pos))]
+                original_tokens = [next_tokens_uncheck[start_pos + i] for i in range(min(total_tokens, len(next_tokens_uncheck) - start_pos))]
                 for i, token in enumerate(accepted_tokens):
                     if start_pos + i < len(next_tokens_uncheck):
                         sampling_output.token_ids[start_pos + i] = token
                 print(f"[Plugin Verify] Batch {batch} - updated tokens from {original_tokens} to {accepted_tokens}")
 
+                # indices 用于统计接受率，使用 num_accepted（只计算draft tokens）
                 indices = num_accepted
-                next_tokens_indices.append(list(range(start_pos, start_pos + len(accepted_tokens))))
+                # next_tokens_indices 应该包含所有实际使用的tokens（包括bonus token）
+                next_tokens_indices.append(list(range(start_pos, start_pos + total_tokens)))
             else:
                 # 原始的贪婪验证方法（作为fallback）
                 next_guess_by_batch = next_tokens_uncheck[start_pos:end]
@@ -410,9 +420,13 @@ class MtpPlugin(Plugin):
         output_space_left = np.minimum(output_space_left1, output_space_left2)
 
         print(f"[Plugin Verify] Output space calculation - output_token_len: {output_token_len}, "
+                   f"batch_max_output_lens: {self.input_metadata.batch_max_output_lens}, "
+                   f"output_space_left1: {output_space_left1}, output_space_left2: {output_space_left2}, "
                    f"output_space_left: {output_space_left}")
 
+        print(f"[Plugin Verify] Before stop_criteria - next_tokens_indices: {next_tokens_indices}")
         self.decoding_policy.stop_criteria(sampling_output, output_space_left, next_tokens_indices)
+        print(f"[Plugin Verify] After stop_criteria - next_tokens_indices: {next_tokens_indices}")
         self.reshape_speculative_outputs(sampling_output, next_tokens_indices)
 
         print(f"[Plugin Verify] Final sampling_output.token_ids: {sampling_output.token_ids}")
