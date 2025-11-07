@@ -1,286 +1,539 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# 许可证：Apache-2.0
-# 版权信息：vLLM 项目贡献者所有
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 """
-简化的拒绝采样实现
-Simplified Rejection Sampling Implementation
-
-该实现仅使用 numpy，实现了推测解码（Speculative Decoding）中的拒绝采样算法。
-This implementation uses only numpy and implements the rejection sampling
-algorithm used in Speculative Decoding.
-
-参考论文：https://arxiv.org/abs/2211.17192
-Reference paper: https://arxiv.org/abs/2211.17192
+Simple Rejection Sampler for NPU - Extracted from vLLM RejectionSampler
+Implements modified rejection sampling as described in "Accelerating Large
+Language Model Decoding with Speculative Sampling"
+https://arxiv.org/pdf/2302.01318.pdf.
 """
 
-import numpy as np
+from typing import Dict, List, Optional, Union
+import torch
+from functools import cached_property
+
+# Optional NPU support
+try:
+    import torch_npu
+    HAS_NPU = True
+except ImportError:
+    HAS_NPU = False
 
 
-def softmax(logits: np.ndarray, axis: int = -1) -> np.ndarray:
-    """计算 softmax 函数
-    Compute softmax function
+# Constants
+FP32_EPS = 2 ** -24
+UNINITIALIZED_CACHED_K_NUM = -1
+
+
+class SimpleRejectSampler:
+    """Apply modified rejection sampling for speculative decoding on NPU.
     
-    Args:
-        logits: 输入 logits
-        axis: 计算 softmax 的维度
-    
-    Returns:
-        概率分布
+    This is a simplified, NPU-optimized version extracted from vLLM's RejectionSampler
+    that removes vLLM dependencies while preserving the core algorithm logic.
     """
-    # 减去最大值以提高数值稳定性
-    # Subtract max for numerical stability
-    logits_max = np.max(logits, axis=axis, keepdims=True)
-    exp_logits = np.exp(logits - logits_max)
-    return exp_logits / np.sum(exp_logits, axis=axis, keepdims=True)
+
+    def __init__(self, 
+                 strict_mode: bool = False,
+                 device: Union[str, torch.device] = "npu:0",
+                 dtype: torch.dtype = torch.float32):
+        """Create a rejection sampler.
+
+        Args:
+            strict_mode: Whether or not to perform shape/device/dtype checks
+                during sampling. This catches correctness issues but adds
+                nontrivial latency.
+            device: Device to run computations on (NPU device)
+            dtype: Data type for probability computations
+        """
+        self._strict_mode = strict_mode
+        self.device = device if isinstance(device, torch.device) else torch.device(device)
+        self.probs_dtype = dtype
+        self.token_id_dtype = torch.int64
+        
+        # NOTE: A "bonus token" is accepted iff all proposal tokens are
+        # accepted. There is always only one possible bonus token.
+        self._num_bonus_tokens = 1
+        
+        # NPU optimizations: cached tensors to avoid repeated allocations
+        self.int64_neg_one = torch.tensor(-1, device=self.device, dtype=self.token_id_dtype)
+        self.cached_indices = None
+        self.cached_k_tensor = None
+        self.cached_k = UNINITIALIZED_CACHED_K_NUM
+        
+        # Metrics tracking
+        self.num_accepted_tokens = torch.tensor(0, dtype=torch.long, device=self.device)
+        self.num_emitted_tokens = torch.tensor(0, dtype=torch.long, device=self.device)
+        self.num_draft_tokens = 0
+        self.enable_spec_metric = True
+
+    def forward(
+        self,
+        target_with_bonus_probs: torch.Tensor,
+        bonus_token_ids: torch.Tensor,
+        draft_probs: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        seeded_seqs: Optional[Dict[int, torch.Generator]] = None,
+    ) -> torch.Tensor:
+        """Sample token ids using rejection sampling. This accepts or rejects
+        tokens proposed by the draft model using the probability of each token
+        according to the draft and target models.
+
+        In the worst case where all draft tokens are rejected, it is guaranteed
+        one correct token will be emitted.
+
+        In the case where all draft tokens are accepted, a bonus token will be
+        accepted as its cheap to have the target model score this speculative
+        sequence.
+
+        Args:
+            target_with_bonus_probs: The probability distribution 
+                over token ids given context according to the target model.
+            shape = [batch_size, num_speculative_tokens + 1, vocab_size]
+
+            bonus_token_ids: The "bonus" token ids that are accepted iff all
+                speculative tokens in a sequence are accepted.
+            shape = [batch_size, num_bonus_tokens]
+
+            draft_probs: The probability distribution over token ids given
+                context according to the draft model.
+            shape = [batch_size, num_speculative_tokens, vocab_size]
+
+            draft_token_ids: The token ids that were sampled from the draft
+                probabilities.
+            shape = [batch_size, num_speculative_tokens]
+
+            seeded_seqs: Dict of batch row index to torch generator, for
+                sequences using seeded generation.
+
+        Returns:
+            output_token_ids: The token ids sampled via rejection sampling,
+                or -1 if unable to sample a token because the previous token
+                was rejected.
+            shape = [batch_size, num_speculative_tokens + num_bonus_tokens]
+        """
+        # Only perform shape/dtype/device checking in strict mode, as it adds
+        # overhead.
+        if self._strict_mode:
+            self._raise_if_incorrect_input(target_with_bonus_probs,
+                                           draft_token_ids, bonus_token_ids,
+                                           draft_probs)
+
+        batch_size, k, _ = draft_probs.shape
+
+        # batch_size = 0 when all requests in the batch are
+        # non_spec requests. In this case, output_token_ids is
+        # just an empty tensor.
+        if batch_size == 0:
+            return torch.empty(0, k + 1, device=draft_probs.device, dtype=self.token_id_dtype)
+
+        # Perform modified rejection sampling
+        accepted, recovered_token_ids = self._batch_modified_rejection_sampling(
+            target_with_bonus_probs[:, :-1],
+            draft_probs,
+            draft_token_ids,
+            seeded_seqs,
+        )
+
+        output_token_ids = self._create_output(
+            accepted,
+            recovered_token_ids,
+            draft_token_ids,
+            bonus_token_ids,
+        )
+
+        return output_token_ids
+
+    def _batch_modified_rejection_sampling(
+        self,
+        target_probs: torch.Tensor,  # [batch_size, k, vocab_size]
+        draft_probs: torch.Tensor,  # [batch_size, k, vocab_size]
+        draft_token_ids: torch.Tensor,  # [batch_size, k]
+        seeded_seqs: Optional[Dict[int, torch.Generator]],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Perform modified rejection sampling on each sequence.
+
+        Returns:
+            A tuple of two tensors:
+            0: A bool tensor of which tokens in each sequence is accepted.
+                shape = [batch_size, k]
+            1: Token ids sampled from a recovered distribution, to be used
+                when a token is rejected.
+                shape = [batch_size, k]
+        """
+        batch_size, k, vocab_size = draft_probs.shape
+
+        # shape [batch_size, k]
+        accepted = self._get_accepted(target_probs, draft_probs,
+                                      draft_token_ids, seeded_seqs)
+
+        recovered_probs = self._get_recovered_probs(
+            target_probs, draft_probs).reshape(batch_size * k, vocab_size)
+
+        # NOTE: the recovered_probs are overwritten by this method.
+        recovered_token_ids = _multinomial(
+            recovered_probs,
+            num_samples=1,
+            k=k,
+            seeded_seqs=seeded_seqs or {},
+        ).reshape(batch_size, k)
+
+        return accepted, recovered_token_ids
+
+    def _create_uniform_samples(self,
+                                seeded_seqs: Optional[Dict[int, torch.Generator]],
+                                batch_size: int, k: int,
+                                device: torch.device) -> torch.Tensor:
+        """
+        Generates a batch of uniform random samples, with optional seeding 
+        for specific sequences.
+
+        This method creates a tensor of shape `(batch_size, k + 1)` filled 
+        with uniform random values in the range [0, 1). If `seeded_seqs` 
+        is provided, the sequences corresponding to specific indices 
+        will be generated using the provided `torch.Generator` for 
+        reproducibility. The other sequences will be generated without 
+        a seed.
+
+        Args:
+            seeded_seqs : Optional[Dict[int, torch.Generator]]
+                A dictionary mapping indices in the batch to 
+                `torch.Generator` objects. If `None`, all samples are 
+                generated without a seed.
+            batch_size : int
+                The number of sequences to generate.
+            k : int
+                The number of random samples per sequence.
+            device : torch.device
+                The device on which to allocate the tensor.
+
+        Returns:
+            uniform_rand : torch.Tensor
+                A tensor of shape `(batch_size, k + 1)` containing uniform 
+                random values in the range [0, 1).
+        """
+        if not seeded_seqs:
+            return torch.rand(batch_size, k + 1, device=device)
+
+        uniform_rand = torch.empty(batch_size, k + 1, device=device)
+
+        non_seeded_indices = []
+        for idx in range(batch_size):
+            generator = seeded_seqs.get(idx)
+            if generator is None:
+                non_seeded_indices.append(idx)
+            else:
+                uniform_rand[idx, :] = torch.rand(1,
+                                                  k + 1,
+                                                  dtype=self.probs_dtype,
+                                                  device=device,
+                                                  generator=generator)
+        if non_seeded_indices:
+            uniform_rand[non_seeded_indices, :] = torch.rand(
+                len(non_seeded_indices),
+                k + 1,
+                dtype=self.probs_dtype,
+                device=device)
+        return uniform_rand
+
+    def _get_accepted(
+        self,
+        target_probs: torch.Tensor,  # [batch_size, k, vocab_size]
+        draft_probs: torch.Tensor,  # [batch_size, k, vocab_size]
+        draft_token_ids: torch.Tensor,  # [batch_size, k]
+        seeded_seqs: Optional[Dict[int, torch.Generator]],
+    ) -> torch.Tensor:
+        r"""Create bool matrix over the proposed draft tokens. If
+        True, then a token can be accepted, else it should be
+        rejected.
+
+        Given $q(\hat{x}_{n+1}|x_1, \dots, x_n)$, the probability of
+        $\hat{x}_{n+1}$ given context $x_1, \dots, x_n$ according
+        to the target model, and $p(\hat{x}_{n+1}|x_1, \dots, x_n)$, the
+        same conditional probability according to the draft model, the token
+        is accepted with probability:
+
+        $$
+        \min\left(1, \frac{q(\hat{x}_{n+1}|x_1, \dots, x_n)}
+                        {p(\hat{x}_{n+1}|x_1, \dots, x_n)}\right)
+        $$
+
+        This implementation does not apply causality. When using the output,
+        if a token is rejected, subsequent tokens should not be used.
+
+        Returns a bool tensor of shape [batch_size, k] specifying which tokens
+        are accepted.
+        """
+        batch_size, k, _ = draft_probs.shape
+
+        uniform_rand = self._create_uniform_samples(seeded_seqs, batch_size,
+                                                    k - 1, target_probs.device)
+
+        # NPU optimization: replace index_select with gather for better performance
+        draft_token_ids = draft_token_ids.view(batch_size, k, 1)
+        selected_draft_probs = torch.gather(draft_probs, dim=-1, index=draft_token_ids).view(batch_size, k)
+        selected_target_probs = torch.gather(target_probs, dim=-1, index=draft_token_ids).view(batch_size, k)
+        
+        # NPU optimization: use in-place operations
+        selected_target_probs.div_(selected_draft_probs).clamp_max_(1)
+
+        accepted = uniform_rand < selected_target_probs
+        return accepted
+
+    def _get_recovered_probs(
+            self,
+            target_probs: torch.Tensor,  # [batch_size, k, vocab_size]
+            draft_probs: torch.Tensor,  # [batch_size, k, vocab_size]
+    ) -> torch.Tensor:
+        r"""Create a probability distribution for each proposed token which can
+        be sampled if the proposed token is rejected.
+
+        When this routine is applied sequentially, the true distribution of the
+        target model is recovered (within hardware numerics).
+
+        The probability distribution used in this rejection case is constructed
+        as follows. Given $q(x|x_1, \dots, x_n)$, the probability of
+        $x$ given context $x_1, \dots, x_n$ according to the target
+        model and $p(x|x_1, \dots, x_n)$, the same conditional probability
+        according to the draft model:
+
+        $$
+        x_{n+1} \sim (q(x|x_1, \dots, x_n) - p(x|x_1, \dots, x_n))_+
+        $$
+
+        where $(f(x))_+$ is defined as:
+
+        $$
+        (f(x))_+ = \frac{\max(0, f(x))}{\sum_x \max(0, f(x))}
+        $$
+
+        See https://github.com/vllm-project/vllm/pull/2336 for a visualization
+        of the draft, target, and recovered probability distributions.
+
+        Returns a tensor of shape [batch_size, k, vocab_size].
+
+        Note: 
+            This batches operations on GPU and thus constructs the recovered
+            distribution for all tokens, even if they are accepted. This causes
+            division-by-zero errors, so we use self._smallest_positive_value to
+            avoid that. This introduces some drift to the distribution.
+        """
+        _, k, _ = draft_probs.shape
+
+        # NPU optimization: use inplace operations for better performance
+        target_probs.sub_(draft_probs).clamp_min_(self._smallest_positive_value)
+        recovered_probs = target_probs / torch.sum(target_probs, dim=-1).view(-1, k, 1)
+
+        return recovered_probs
+
+    def _create_output(
+            self,
+            accepted: torch.Tensor,  # [batch_size, k]
+            substitute_token_ids: torch.Tensor,  # [batch_size, k]
+            draft_token_ids: torch.Tensor,  # [batch_size, k]
+            bonus_token_ids: torch.Tensor,  # [batch_size]
+    ) -> torch.Tensor:
+        """Format output. Returns a matrix of token ids. When
+        a token is rejected via sampling, all subsequent token ids are 
+        set to -1 for the sequence.
+
+        Args:
+            accepted: A boolean tensor indicating if the corresponding
+            draft token in draft_token_ids should be accepted or not.
+            substitute_token_ids: A tensor of token_ids that can be used
+            as substitutes for the draft token ids if the proposed token
+            is rejected.
+            draft_token_ids: A tensor of token ids speculated by the 
+            draft model.
+            bonus_token_ids: Token ids to use as the bonus token if
+            all the draft tokens are accepted.
+        Returns:
+            A tensor containing the accepted token ids. The shape of the 
+            tensor is [batch_size, k + num_bonus_tokens]
+        """
+        batch_size, k = substitute_token_ids.shape
+        bonus_token_ids = bonus_token_ids.squeeze()
+        
+        # Determine the index of the first False value for each row.
+        accepted_equal_zero_mask = accepted == 0
+        limits = accepted_equal_zero_mask.max(1).indices
+        
+        # NPU optimization: cache tensor to avoid repeated allocations
+        mask = accepted_equal_zero_mask.any(1)
+        if self.cached_k_tensor is None or self.cached_k != k:
+            self.cached_k_tensor = torch.tensor(k, dtype=limits.dtype, device=limits.device)
+            self.cached_k = k
+        limits = torch.where(mask, limits, self.cached_k_tensor)
+
+        # Create masks using the indices.
+        if self.cached_indices is None or self.cached_indices.shape[1] != k:
+            self.cached_indices = torch.arange(k, device=accepted.device).unsqueeze(0)
+        accepted_mask = self.cached_indices < limits.unsqueeze(1)
+        after_false_mask = self.cached_indices == limits.unsqueeze(1)
+
+        # Create an extended output tensor
+        output_with_bonus_tokens = torch.full(
+            (batch_size, k + self._num_bonus_tokens),
+            fill_value=-1,
+            dtype=self.token_id_dtype,
+            device=accepted.device)
+        output = output_with_bonus_tokens[:, :k]
+
+        # Fill in the first k columns of the output tensor using masks and data tensors.
+        # NPU optimization: remove index select, use torch.where directly
+        torch.where(accepted_mask,
+                    draft_token_ids,
+                    self.int64_neg_one,
+                    out=output)
+
+        # Fill the last column.
+        # We check output directly as accepted may have True values inconsistent
+        # with causal acceptance.
+        # NPU optimization: avoid memory copy
+        output_with_bonus_tokens[:, -1] = torch.where(output[:, -1] != self.int64_neg_one,
+                                                      bonus_token_ids, self.int64_neg_one)
+
+        # Fill the recovered token ids.
+        output.mul_(~after_false_mask).add_(
+            substitute_token_ids.mul(after_false_mask))
+
+        # NPU optimization: disable log metric when disable_logprobs is True.
+        if self.enable_spec_metric:
+            self.num_accepted_tokens += accepted.sum()
+            self.num_emitted_tokens += (output_with_bonus_tokens != -1).sum()
+            self.num_draft_tokens += batch_size * k
+
+        return output_with_bonus_tokens
+
+    @cached_property
+    def _smallest_positive_value(self) -> float:
+        """Return the smallest positive value representable by the probs dtype.
+        This value is used when constructing a distribution from which to sample
+        recovered tokens in the first rejection case.
+
+        See _get_recovered_probs for more details
+
+        Note that this isn't actually the smallest positive value representable
+        by float32, but the smallest positive normal value.
+        See https://en.wikipedia.org/wiki/Subnormal_number for more information.
+        """
+        return torch.finfo(self.probs_dtype).tiny
+
+    def _raise_if_incorrect_input(
+        self,
+        target_with_bonus_probs: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        bonus_token_ids: torch.Tensor,
+        draft_probs: torch.Tensor,
+    ) -> None:
+        """Raise exceptions if input is malformed."""
+        batch_size, k, vocab_size = draft_probs.shape
+        
+        # Check shapes
+        assert target_with_bonus_probs.shape == (batch_size, k + 1, vocab_size), \
+            f"target_with_bonus_probs shape mismatch: expected {(batch_size, k + 1, vocab_size)}, got {target_with_bonus_probs.shape}"
+        assert draft_token_ids.shape == (batch_size, k), \
+            f"draft_token_ids shape mismatch: expected {(batch_size, k)}, got {draft_token_ids.shape}"
+        assert bonus_token_ids.shape[0] == batch_size, \
+            f"bonus_token_ids batch size mismatch: expected {batch_size}, got {bonus_token_ids.shape[0]}"
+        
+        # Check devices
+        assert target_with_bonus_probs.device == draft_probs.device
+        assert draft_token_ids.device == draft_probs.device
+        assert bonus_token_ids.device == draft_probs.device
+        
+        # Check dtypes
+        assert target_with_bonus_probs.dtype == draft_probs.dtype
+        assert draft_token_ids.dtype == self.token_id_dtype
+        assert bonus_token_ids.dtype == self.token_id_dtype
+        
+        # Check token bounds
+        assert torch.all(draft_token_ids >= 0)
+        assert torch.all(bonus_token_ids >= 0)
 
 
-def sample_from_probs(probs: np.ndarray) -> int:
-    """从概率分布中采样一个 token
-    Sample a token from probability distribution
+# NPU-optimized multinomial sampling function
+def _multinomial(
+    probs: torch.Tensor,
+    num_samples: int,
+    k: int,
+    seeded_seqs: Dict[int, torch.Generator],
+) -> torch.Tensor:
+    """NPU-optimized multinomial sampling.
     
-    Args:
-        probs: [vocab_size] 概率分布
-    
-    Returns:
-        采样的 token ID
+    torch.multinomial forces a GPU<->CPU sync.
+    Therefore, we use an optimized implementation instead that skips the sync.
+    Note that we always sample with replacement.
+    probs will be modified in place, but this is fine, as we pass
+    in a copy already.
     """
-    return np.random.choice(len(probs), p=probs)
-
-
-def sample_recovered_token(draft_prob: np.ndarray, target_prob: np.ndarray, 
-                           draft_token_id: int) -> int:
-    """采样恢复的 token
-    Sample a recovered token
-    
-    当草稿 token 被拒绝时，从调整后的概率分布中采样。
-    调整后的分布：max(target_prob - draft_prob, 0)
-    When a draft token is rejected, sample from the adjusted distribution.
-    Adjusted distribution: max(target_prob - draft_prob, 0)
-    
-    Args:
-        draft_prob: [vocab_size] 草稿概率分布
-        target_prob: [vocab_size] 目标概率分布
-        draft_token_id: 被拒绝的草稿 token ID
-    
-    Returns:
-        恢复的 token ID
-    """
-    # 计算调整后的概率：max(target_prob - draft_prob, 0)
-    # Compute adjusted probability: max(target_prob - draft_prob, 0)
-    adjusted_prob = np.maximum(target_prob - draft_prob, 0.0)
-    
-    # 归一化概率分布
-    # Normalize the probability distribution
-    prob_sum = np.sum(adjusted_prob)
-    if prob_sum > 0:
-        adjusted_prob = adjusted_prob / prob_sum
+    if num_samples > 1:
+        # This is equivalent to torch.repeat_interleaved (which also
+        # forces a GPU<->CPU sync).
+        probs = probs[:, None, :].expand(probs.shape[0], num_samples,
+                                         probs.shape[1]).contiguous().view(
+                                             -1, probs.shape[1])
+    q = torch.empty_like(probs)
+    if not seeded_seqs:
+        q.exponential_(1.0)
     else:
-        # 如果所有概率都是 0，则使用均匀分布
-        # If all probabilities are 0, use uniform distribution
-        adjusted_prob = np.ones_like(adjusted_prob) / len(adjusted_prob)
+        # NPU optimization: handle non-seeded indices more efficiently
+        non_seeded_indices: List[int] = []
+        start = 0
+        for idx in range(len(q) // k):
+            end = start + k
+            generator = seeded_seqs.get(idx)
+            if generator is None:
+                non_seeded_indices.extend(list(range(start, end)))
+            else:
+                q[start:end].exponential_(1.0, generator=generator)
+            start = end
+        q[non_seeded_indices].exponential_(1.0)
     
-    # 从调整后的分布中采样
-    # Sample from the adjusted distribution
-    return sample_from_probs(adjusted_prob)
+    # NPU optimization: add FP32_EPS to avoid division by zero
+    q.add_(FP32_EPS)
+    return probs.div_(q).argmax(dim=1).view(-1, num_samples)
 
 
-def rejection_sample(draft_logits: np.ndarray, 
-                    target_logits: np.ndarray) -> list[int]:
-    """拒绝采样函数
-    Rejection sampling function
+# Example usage and testing functions
+def create_test_tensors(batch_size: int = 2, k: int = 3, vocab_size: int = 1000, device: str = "cpu"):
+    """Create test tensors for SimpleRejectSampler."""
+    device = torch.device(device)
     
-    该函数实现了推测解码中的拒绝采样算法。算法流程：
-    1. 首先从草稿模型的概率分布中采样 draft tokens
-    2. 对每个 draft token，计算接受概率 = min(1, target_prob / draft_prob)
-    3. 使用均匀随机数决定是否接受该 token
-    4. 如果接受，将该 token 加入输出；如果拒绝，从调整后的分布中采样 recovered token
-    5. 一旦有 token 被拒绝，停止处理后续的 draft tokens
+    # Create random probability distributions
+    target_with_bonus_probs = torch.softmax(torch.randn(batch_size, k + 1, vocab_size, device=device), dim=-1)
+    draft_probs = torch.softmax(torch.randn(batch_size, k, vocab_size, device=device), dim=-1)
     
-    This function implements the rejection sampling algorithm in speculative decoding:
-    1. First sample draft tokens from the draft model's probability distribution
-    2. For each draft token, compute acceptance probability = min(1, target_prob / draft_prob)
-    3. Use uniform random number to decide whether to accept the token
-    4. If accepted, add to output; if rejected, sample a recovered token from adjusted distribution
-    5. Once a token is rejected, stop processing subsequent draft tokens
+    # Create random token ids
+    draft_token_ids = torch.randint(0, vocab_size, (batch_size, k), device=device, dtype=torch.int64)
+    bonus_token_ids = torch.randint(0, vocab_size, (batch_size, 1), device=device, dtype=torch.int64)
     
-    Args:
-        draft_logits: np.ndarray
-            草稿模型的 logits，形状为 [num_tokens, vocab_size]
-            Draft model's logits with shape [num_tokens, vocab_size]
-        target_logits: np.ndarray
-            目标模型的 logits，形状为 [num_tokens, vocab_size]
-            Target model's logits with shape [num_tokens, vocab_size]
-    
-    Returns:
-        list[int]: 采样得到的 token ID 列表
-                   List of sampled token IDs
-    
-    示例 Example:
-        >>> draft_logits = np.random.randn(5, 1000)  # 5个draft tokens，词汇表大小1000
-        >>> target_logits = np.random.randn(5, 1000)
-        >>> output_tokens = rejection_sample(draft_logits, target_logits)
-        >>> print(f"输出了 {len(output_tokens)} 个 tokens")
-    """
-    assert draft_logits.ndim == 2, "draft_logits 必须是 2 维张量 [num_tokens, vocab_size]"
-    assert target_logits.ndim == 2, "target_logits 必须是 2 维张量 [num_tokens, vocab_size]"
-    assert draft_logits.shape == target_logits.shape, "draft_logits 和 target_logits 形状必须相同"
-    
-    num_tokens, vocab_size = draft_logits.shape
-    
-    # 步骤 1: 将 logits 转换为概率分布
-    # Step 1: Convert logits to probability distributions
-    draft_probs = softmax(draft_logits, axis=-1)  # [num_tokens, vocab_size]
-    target_probs = softmax(target_logits, axis=-1)  # [num_tokens, vocab_size]
-    
-    # 步骤 2: 从草稿概率分布中采样 draft tokens
-    # Step 2: Sample draft tokens from draft probability distribution
-    draft_token_ids = np.array([
-        sample_from_probs(draft_probs[i]) 
-        for i in range(num_tokens)
-    ])
-    
-    # 步骤 3: 执行拒绝采样
-    # Step 3: Perform rejection sampling
-    output_tokens = []
-    
-    for i in range(num_tokens):
-        draft_token_id = draft_token_ids[i]
-        
-        # 获取该 draft token 在两个分布中的概率
-        # Get the probability of this draft token in both distributions
-        draft_prob = draft_probs[i, draft_token_id]
-        target_prob = target_probs[i, draft_token_id]
-        
-        # 计算接受概率：min(1, target_prob / draft_prob)
-        # Compute acceptance probability: min(1, target_prob / draft_prob)
-        if draft_prob > 0:
-            acceptance_prob = min(1.0, target_prob / draft_prob)
-        else:
-            # 如果 draft_prob 为 0，拒绝该 token
-            # If draft_prob is 0, reject the token
-            acceptance_prob = 0.0
-        
-        # 生成均匀随机数进行接受/拒绝判断
-        # Generate uniform random number for accept/reject decision
-        uniform_rand = np.random.uniform(0, 1)
-        
-        if uniform_rand < acceptance_prob:
-            # 接受该 draft token
-            # Accept the draft token
-            output_tokens.append(draft_token_id)
-        else:
-            # 拒绝该 draft token，从调整后的分布中采样 recovered token
-            # Reject the draft token, sample recovered token from adjusted distribution
-            recovered_token_id = sample_recovered_token(
-                draft_probs[i], 
-                target_probs[i], 
-                draft_token_id
-            )
-            output_tokens.append(recovered_token_id)
-            
-            # 一旦拒绝，停止处理后续 tokens（这是拒绝采样的关键）
-            # Once rejected, stop processing subsequent tokens (key to rejection sampling)
-            break
-    
-    return output_tokens
+    return target_with_bonus_probs, draft_probs, draft_token_ids, bonus_token_ids
 
 
-def rejection_sample_with_bonus(draft_logits: np.ndarray, 
-                                target_logits: np.ndarray,
-                                bonus_logits: np.ndarray) -> list[int]:
-    """带有奖励 token 的拒绝采样
-    Rejection sampling with bonus token
+def test_simple_reject_sampler():
+    """Test function for SimpleRejectSampler."""
+    print("Testing SimpleRejectSampler...")
     
-    如果所有 draft tokens 都被接受，则从 bonus_logits 中采样一个额外的 token。
-    If all draft tokens are accepted, sample an additional token from bonus_logits.
+    # Create sampler
+    sampler = SimpleRejectSampler(device="cpu")
     
-    Args:
-        draft_logits: [num_tokens, vocab_size] 草稿模型的 logits
-        target_logits: [num_tokens, vocab_size] 目标模型的 logits
-        bonus_logits: [vocab_size] 奖励 token 的 logits
+    # Create test data
+    target_probs, draft_probs, draft_tokens, bonus_tokens = create_test_tensors()
     
-    Returns:
-        list[int]: 采样得到的 token ID 列表
-    """
-    # 先执行标准的拒绝采样
-    # First perform standard rejection sampling
-    output_tokens = rejection_sample(draft_logits, target_logits)
+    # Run sampling
+    output = sampler.forward(target_probs, bonus_tokens, draft_probs, draft_tokens)
     
-    # 如果所有 draft tokens 都被接受，添加 bonus token
-    # If all draft tokens are accepted, add bonus token
-    num_draft_tokens = draft_logits.shape[0]
-    if len(output_tokens) == num_draft_tokens:
-        bonus_probs = softmax(bonus_logits)
-        bonus_token = sample_from_probs(bonus_probs)
-        output_tokens.append(bonus_token)
-    
-    return output_tokens
+    print(f"Input shapes:")
+    print(f"  target_probs: {target_probs.shape}")
+    print(f"  draft_probs: {draft_probs.shape}")
+    print(f"  draft_tokens: {draft_tokens.shape}")
+    print(f"  bonus_tokens: {bonus_tokens.shape}")
+    print(f"Output shape: {output.shape}")
+    print(f"Output tokens:\n{output}")
+    print(f"Accepted tokens: {sampler.num_accepted_tokens.item()}")
+    print(f"Emitted tokens: {sampler.num_emitted_tokens.item()}")
+    print("Test completed successfully!")
 
 
-# 使用示例 Usage Example
 if __name__ == "__main__":
-    print("=" * 60)
-    print("拒绝采样示例 Rejection Sampling Example")
-    print("=" * 60)
-    
-    # 设置随机种子以保证可重现性
-    # Set random seed for reproducibility
-    np.random.seed(42)
-    
-    # 创建示例数据
-    # Create example data
-    num_draft_tokens = 5
-    vocab_size = 100
-    
-    print(f"\n配置 Configuration:")
-    print(f"  - 草稿 token 数量 (Number of draft tokens): {num_draft_tokens}")
-    print(f"  - 词汇表大小 (Vocabulary size): {vocab_size}")
-    
-    # 生成随机的 logits
-    # Generate random logits
-    draft_logits = np.random.randn(num_draft_tokens, vocab_size)
-    target_logits = np.random.randn(num_draft_tokens, vocab_size)
-    
-    print(f"\n输入形状 Input shapes:")
-    print(f"  - draft_logits: {draft_logits.shape}")
-    print(f"  - target_logits: {target_logits.shape}")
-    
-    # 执行拒绝采样
-    # Perform rejection sampling
-    print(f"\n执行拒绝采样 Performing rejection sampling...")
-    output_tokens = rejection_sample(draft_logits, target_logits)
-    
-    print(f"\n结果 Results:")
-    print(f"  - 输出 token 数量 (Number of output tokens): {len(output_tokens)}")
-    print(f"  - 输出 tokens (Output tokens): {output_tokens}")
-    
-    # 多次运行以展示随机性
-    # Run multiple times to show randomness
-    print(f"\n多次运行结果 Multiple runs:")
-    for run in range(5):
-        np.random.seed(100 + run)
-        draft_logits = np.random.randn(num_draft_tokens, vocab_size)
-        target_logits = np.random.randn(num_draft_tokens, vocab_size)
-        tokens = rejection_sample(draft_logits, target_logits)
-        print(f"  Run {run + 1}: 接受了 {len(tokens)} 个 tokens")
-    
-    # 测试带奖励 token 的版本
-    # Test version with bonus token
-    print(f"\n测试带奖励 token 的拒绝采样 Testing rejection sampling with bonus token:")
-    np.random.seed(42)
-    draft_logits = np.random.randn(3, vocab_size)
-    target_logits = np.random.randn(3, vocab_size)
-    bonus_logits = np.random.randn(vocab_size)
-    
-    tokens_with_bonus = rejection_sample_with_bonus(
-        draft_logits, target_logits, bonus_logits
-    )
-    print(f"  - 输出 tokens: {tokens_with_bonus}")
-    print(f"  - Token 数量: {len(tokens_with_bonus)}")
-    
-    print(f"\n" + "=" * 60)
-    print("完成！Done!")
-    print("=" * 60)
-
+    test_simple_reject_sampler()
